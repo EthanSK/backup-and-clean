@@ -120,6 +120,53 @@ format_bytes() {
     fi
 }
 
+format_seconds() {
+    local s="$1"
+    if [ "$s" -lt 60 ]; then
+        echo "${s}s"
+    elif [ "$s" -lt 3600 ]; then
+        printf '%dm %02ds' $((s/60)) $((s%60))
+    else
+        printf '%dh %02dm' $((s/3600)) $(((s%3600)/60))
+    fi
+}
+
+# Polls a destination temp file size while a copy is in progress and logs
+# percentage / rate / ETA every PROGRESS_INTERVAL seconds.
+# Args: $1 = path to temp file being written, $2 = total source size in bytes,
+#       $3 = friendly name for log lines.
+PROGRESS_INTERVAL="${PROGRESS_INTERVAL:-10}"
+poll_copy_progress() {
+    local temp_file="$1"
+    local source_size="$2"
+    local label="$3"
+    local start_ts copied now_ts elapsed rate_bps eta_sec pct rate_hr eta_hr
+    start_ts=$(date +%s)
+    while sleep "$PROGRESS_INTERVAL"; do
+        # Stop when temp file disappears (copy finished or aborted).
+        [ -f "$temp_file" ] || break
+        copied=$(get_file_size "$temp_file")
+        now_ts=$(date +%s)
+        elapsed=$((now_ts - start_ts))
+        if [ "$elapsed" -gt 0 ] && [ "${copied:-0}" -gt 0 ]; then
+            rate_bps=$((copied / elapsed))
+            if [ "${source_size:-0}" -gt 0 ]; then
+                pct=$(( copied * 100 / source_size ))
+            else
+                pct=0
+            fi
+            if [ "$rate_bps" -gt 0 ] && [ "${source_size:-0}" -gt "$copied" ]; then
+                eta_sec=$(( (source_size - copied) / rate_bps ))
+                eta_hr=$(format_seconds "$eta_sec")
+            else
+                eta_hr="?"
+            fi
+            rate_hr=$(format_bytes "$rate_bps")
+            log_message "    PROGRESS: $label — ${pct}% ($(format_bytes "$copied") / $(format_bytes "$source_size")), ${rate_hr}/s, ETA ${eta_hr}"
+        fi
+    done
+}
+
 get_file_size() {
     local file="$1"
     if stat -f%z "$file" 2>/dev/null; then
@@ -150,7 +197,7 @@ files_match() {
 copy_with_verification() {
     local source_file="$1"
     local backup_file="$2"
-    local backup_subdir backup_basename temp_file
+    local backup_subdir backup_basename temp_file source_size cp_pid poll_pid cp_status copy_start copy_end copy_elapsed avg_rate
 
     backup_subdir=$(dirname "$backup_file")
     backup_basename=$(basename "$backup_file")
@@ -158,9 +205,38 @@ copy_with_verification() {
     mkdir -p "$backup_subdir" || return 1
     temp_file=$(mktemp "$backup_subdir/.${backup_basename}.tmp.XXXXXX") || return 1
 
-    if ! cp -p "$source_file" "$temp_file" 2>/dev/null; then
+    source_size=$(get_file_size "$source_file")
+    copy_start=$(date +%s)
+
+    # Run cp in the background so a sibling poller can report progress.
+    cp -p "$source_file" "$temp_file" 2>/dev/null &
+    cp_pid=$!
+
+    # Only worth polling for files large enough that user actually waits on them.
+    # 50 MiB threshold — smaller files finish in well under one PROGRESS_INTERVAL.
+    if [ "${source_size:-0}" -ge 52428800 ]; then
+        poll_copy_progress "$temp_file" "$source_size" "$(basename "$source_file")" &
+        poll_pid=$!
+    fi
+
+    wait "$cp_pid"
+    cp_status=$?
+
+    if [ -n "${poll_pid:-}" ]; then
+        kill "$poll_pid" 2>/dev/null
+        wait "$poll_pid" 2>/dev/null
+    fi
+
+    if [ "$cp_status" -ne 0 ]; then
         rm -f "$temp_file"
         return 1
+    fi
+
+    copy_end=$(date +%s)
+    copy_elapsed=$((copy_end - copy_start))
+    if [ "$copy_elapsed" -gt 0 ] && [ "${source_size:-0}" -gt 0 ]; then
+        avg_rate=$((source_size / copy_elapsed))
+        log_message "    cp done: $(basename "$source_file") in $(format_seconds "$copy_elapsed") avg $(format_bytes "$avg_rate")/s — verifying byte-by-byte..."
     fi
 
     if ! cmp -s "$source_file" "$temp_file" 2>/dev/null; then
