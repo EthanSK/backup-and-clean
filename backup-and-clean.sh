@@ -11,13 +11,22 @@
 #
 # Usage:
 #   ./backup-and-clean.sh [--config <path>] [--action <action>] [--headless]
+#                         [--empty-trash | --no-empty-trash]
 #
 # Actions: copy, delete, copy+delete, dry-run
 #
 # Options:
-#   --config <path>   Path to config file (default: ~/.backup-and-clean.env)
-#   --action <action> Run non-interactively with the given action
-#   --headless        Run without GUI dialogs (log to terminal only)
+#   --config <path>      Path to config file (default: ~/.backup-and-clean.env)
+#   --action <action>    Run non-interactively with the given action
+#   --headless           Run without GUI dialogs (log to terminal only)
+#   --empty-trash        After delete, purge volume-local Trash for every
+#                        volume that received files (overrides config + skips
+#                        the interactive prompt). Frees the actual space.
+#   --no-empty-trash     Force-skip the empty-trash step.
+#
+# Without --empty-trash / --no-empty-trash, the script falls back to the
+# EMPTY_TRASH_ON_COMPLETE config var (1 = always empty, 0 = never), and
+# finally to an interactive Empty Now / Leave in Trash dialog (GUI mode only).
 
 set -euo pipefail
 
@@ -25,6 +34,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="${CONFIG_FILE:-$HOME/.backup-and-clean.env}"
 HEADLESS=0
 ACTION=""
+# 0 = off, 1 = on, "" = unset (fall through to config / interactive prompt)
+EMPTY_TRASH_FLAG=""
 
 # --- Argument parsing ---
 
@@ -42,8 +53,16 @@ while [[ $# -gt 0 ]]; do
             HEADLESS=1
             shift
             ;;
+        --empty-trash)
+            EMPTY_TRASH_FLAG=1
+            shift
+            ;;
+        --no-empty-trash)
+            EMPTY_TRASH_FLAG=0
+            shift
+            ;;
         --help|-h)
-            head -20 "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \?//'
+            head -32 "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -252,24 +271,67 @@ copy_with_verification() {
     return 0
 }
 
+# Volumes that received moved-to-trash files this run. Tracked so the
+# optional Empty Trash phase only purges trashes we actually wrote to.
+TRASH_VOLUMES=()
+
+record_trash_volume() {
+    local v="$1"
+    local existing
+    for existing in "${TRASH_VOLUMES[@]:-}"; do
+        [ "$existing" = "$v" ] && return 0
+    done
+    TRASH_VOLUMES+=("$v")
+}
+
 move_to_trash() {
     local file="$1"
 
-    # Try volume-local .Trashes first (instant, no extra space)
+    # Try volume-local .Trashes first (instant, no extra space).
+    # NB: files in .Trashes still occupy the volume's space until Empty Trash
+    # actually purges them — that's what the post-completion empty-trash phase
+    # handles when EMPTY_TRASH_ON_COMPLETE / --empty-trash / interactive Empty Now is selected.
     local volume trash_dir
     volume=$(df "$file" 2>/dev/null | tail -1 | awk '{print $NF}')
     trash_dir="${volume}/.Trashes/$(id -u)"
     mkdir -p "$trash_dir" 2>/dev/null
     if mv "$file" "$trash_dir/" 2>/dev/null; then
+        record_trash_volume "$volume"
         return 0
     fi
 
-    # Fallback to user's home trash
+    # Fallback to user's home trash (sentinel "/" → $HOME/.Trash on the system volume).
     if mv "$file" "$HOME/.Trash/" 2>/dev/null; then
+        record_trash_volume "/"
         return 0
     fi
 
     return 1
+}
+
+# Echoes total bytes purged across all tracked volumes.
+empty_volume_trashes() {
+    local v trash_dir size_before total_freed=0
+    for v in "${TRASH_VOLUMES[@]:-}"; do
+        [ -z "$v" ] && continue
+        if [ "$v" = "/" ]; then
+            trash_dir="$HOME/.Trash"
+        else
+            trash_dir="${v}/.Trashes/$(id -u)"
+        fi
+        [ -d "$trash_dir" ] || continue
+        size_before=$(du -sk "$trash_dir" 2>/dev/null | awk '{print $1*1024}')
+        size_before="${size_before:-0}"
+        log_message "EMPTYING TRASH: $trash_dir ($(format_bytes "$size_before"))..." >&2
+        # Purge contents but keep the .Trashes/<uid> dir itself so macOS doesn't
+        # have to recreate it with new permissions on next move_to_trash.
+        find "$trash_dir" -mindepth 1 -delete 2>/dev/null \
+            || rm -rf -- "$trash_dir"/* "$trash_dir"/.[!.]* 2>/dev/null \
+            || true
+        total_freed=$((total_freed + size_before))
+        log_message "TRASH EMPTIED: $trash_dir — freed $(format_bytes "$size_before")" >&2
+    done
+    echo "$total_freed"
 }
 
 # --- Preflight checks ---
@@ -470,7 +532,7 @@ for src_dir in "${active_sources[@]}"; do
     done < <(find "$src_dir" -type f -name "$FILE_PATTERN" -print0)
 done
 
-space_freed_hr=$(format_bytes "$total_space_freed")
+moved_to_trash_hr=$(format_bytes "$total_space_freed")
 
 log_message "=== Process Complete ==="
 
@@ -478,17 +540,54 @@ if [ "$dry_run" -eq 1 ]; then
     log_message "DRY RUN - Would delete: $deleted_count files"
     log_message "Skipped (no backup): $missing_backup_count"
     log_message "Skipped (size mismatch): $verification_failed_count"
-    log_message "Space that would be freed: $space_freed_hr"
+    log_message "Space that would be freed: $moved_to_trash_hr"
 
-    show_dialog "DRY RUN Complete (nothing was deleted)\n\nWould delete: $deleted_count files\nSkipped (no backup): $missing_backup_count\nSkipped (size mismatch): $verification_failed_count\nSpace that would be freed: $space_freed_hr\n\nSee $LOG_FILE for details."
+    show_dialog "DRY RUN Complete (nothing was deleted)\n\nWould delete: $deleted_count files\nSkipped (no backup): $missing_backup_count\nSkipped (size mismatch): $verification_failed_count\nSpace that would be freed: $moved_to_trash_hr\n\nSee $LOG_FILE for details."
+    exit 0
+fi
+
+log_message "Deleted: $deleted_count"
+log_message "Skipped (no backup): $missing_backup_count"
+log_message "Skipped (size mismatch): $verification_failed_count"
+log_message "Failed (in use): $delete_failed_count"
+log_message "Moved to Trash: $moved_to_trash_hr (still occupies volume space until Empty Trash)"
+
+# --- Optional Empty Trash phase ---
+# Resolution order:
+#   1. CLI flag (--empty-trash / --no-empty-trash) — wins outright
+#   2. EMPTY_TRASH_ON_COMPLETE env / config var (1 = always empty, 0 = never)
+#   3. Interactive osascript prompt (only if not headless)
+
+should_empty=0
+if [ ${#TRASH_VOLUMES[@]} -gt 0 ]; then
+    if [ -n "$EMPTY_TRASH_FLAG" ]; then
+        should_empty="$EMPTY_TRASH_FLAG"
+    elif [ "${EMPTY_TRASH_ON_COMPLETE:-}" = "1" ]; then
+        should_empty=1
+    elif [ "${EMPTY_TRASH_ON_COMPLETE:-}" = "0" ]; then
+        should_empty=0
+    elif [ "$HEADLESS" -eq 0 ]; then
+        prompt_msg="All deleted files have been moved to the volume-local Trash, but they still occupy ${moved_to_trash_hr} on ${#TRASH_VOLUMES[@]} volume(s) until you Empty Trash.\n\nEmpty Trash now to actually free the space?"
+        btn=$(osascript -e "display dialog \"${prompt_msg}\" buttons {\"Leave in Trash\", \"Empty Now\"} default button \"Empty Now\" with icon caution" 2>/dev/null) || btn=""
+        if [[ "$btn" == *"Empty Now"* ]]; then
+            should_empty=1
+        fi
+    fi
+fi
+
+purged_hr=""
+if [ "$should_empty" = "1" ] && [ ${#TRASH_VOLUMES[@]} -gt 0 ]; then
+    log_message "--- Empty Trash Phase ---"
+    purged_bytes=$(empty_volume_trashes)
+    purged_hr=$(format_bytes "${purged_bytes:-0}")
+    log_message "Trash purged: $purged_hr across ${#TRASH_VOLUMES[@]} volume(s)"
+fi
+
+# Final summary dialog reflects the actual outcome (with or without empty-trash).
+if [ -n "$purged_hr" ]; then
+    show_dialog "Complete!\n\nDeleted: $deleted_count\nSkipped (no backup): $missing_backup_count\nSkipped (size mismatch): $verification_failed_count\nFailed (in use): $delete_failed_count\nMoved to Trash: $moved_to_trash_hr\nTrash purged: $purged_hr (space actually freed)\n\nSee $LOG_FILE for details."
 else
-    log_message "Deleted: $deleted_count"
-    log_message "Skipped (no backup): $missing_backup_count"
-    log_message "Skipped (size mismatch): $verification_failed_count"
-    log_message "Failed (in use): $delete_failed_count"
-    log_message "Space freed: $space_freed_hr"
-
-    show_dialog "Complete!\n\nDeleted: $deleted_count\nSkipped (no backup): $missing_backup_count\nSkipped (size mismatch): $verification_failed_count\nFailed (in use): $delete_failed_count\nSpace freed: $space_freed_hr\n\nSee $LOG_FILE for details."
+    show_dialog "Complete!\n\nDeleted: $deleted_count\nSkipped (no backup): $missing_backup_count\nSkipped (size mismatch): $verification_failed_count\nFailed (in use): $delete_failed_count\nMoved to Trash: $moved_to_trash_hr (still on volume — Empty Trash to free space)\n\nSee $LOG_FILE for details."
 fi
 
 exit 0
